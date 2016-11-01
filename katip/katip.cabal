@@ -40,6 +40,7 @@ library
     Katip.Format.Time
     Katip.Monadic
     Katip.Scribes.Handle
+    Katip.Scribes.HandleUtf8
 
   default-extensions:
     DeriveGeneric
@@ -118,6 +119,7 @@ benchmark bench
                  base
                , aeson
                , blaze-builder
+               , bytestring
                , katip
                , criterion >= 1.1.0.0
                , unix

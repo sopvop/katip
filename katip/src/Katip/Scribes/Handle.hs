@@ -1,4 +1,5 @@
-{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards   #-}
 
 module Katip.Scribes.Handle where
 
@@ -11,7 +12,9 @@ import           Data.Aeson
 import qualified Data.HashMap.Strict     as HM
 import           Data.Monoid
 import           Data.Text               (Text)
+import           Data.Text.Lazy          (toStrict)
 import           Data.Text.Lazy.Builder
+import           Data.Text.Lazy.Encoding
 import           Data.Text.Lazy.IO       as T
 import           System.IO
 import           System.IO.Unsafe        (unsafePerformIO)
@@ -19,12 +22,30 @@ import           System.IO.Unsafe        (unsafePerformIO)
 import           Katip.Core
 import           Katip.Format.Time       (formatAsLogTime)
 -------------------------------------------------------------------------------
-
+import qualified Data.ByteString         as B
+import qualified Data.ByteString.Builder as LB
 
 -------------------------------------------------------------------------------
 brackets :: Builder -> Builder
-brackets m = fromText "[" <> m <> fromText "]"
+brackets m = singleton '[' <> m <> singleton ']'
+{-# INLINE brackets #-}
 
+getKeys' :: LogItem s => Verbosity -> s -> Builder
+getKeys' verb a = foldPairs mempty $ HM.toList (payloadObject verb a)
+  where
+    renderPair :: Builder -> (Text, Value) -> Builder
+    renderPair prefix (k,v) =
+      case v of
+        Object o -> foldPairs (key <> singleton '.') $ HM.toList o
+        String t -> brackets  (key <> singleton ':' <> fromText t)
+        Number n -> brackets  (key <> singleton ':' <> fromString (show n)) -- bad
+        Bool   b -> brackets  (key <> singleton ':' <> fromString (show b))
+        Null     -> brackets  (key <> ":null")
+        _ -> mempty -- Can't think of a sensible way to handle arrays
+      where
+        key = prefix <> fromText k
+    foldPairs prefix = foldr (go prefix) mempty
+    go prefix (key,value) acc = renderPair prefix (key,value) <> acc
 
 -------------------------------------------------------------------------------
 getKeys :: LogItem s => Verbosity -> s -> [Builder]
@@ -66,19 +87,35 @@ mkHandleScribe cs h sev verb = do
     lock <- newMVar ()
     return $ Scribe $ \ i@Item{..} -> do
       when (permitItem sev i) $ bracket_ (takeMVar lock) (putMVar lock ()) $
-        T.hPutStrLn h $ toLazyText $ formatItem colorize verb i
+        --B.hPutStr h $ encodeUtf8 . toLazyText $ formatItem colorize verb i <> singleton '\n'
+        T.hPutStrLn h $ toLazyTextWith 4096 $ formatItem colorize verb i
 
+
+-------------------------------------------------------------------------------
+mkHandleScribeUtf8 :: ColorStrategy -> Handle -> Severity -> Verbosity -> IO Scribe
+mkHandleScribeUtf8 cs h sev verb = do
+    hSetBinaryMode h True
+    hSetBuffering h (BlockBuffering (Just 4096))
+    colorize <- case cs of
+      ColorIfTerminal -> hIsTerminalDevice h
+      ColorLog b -> return b
+    lock <- newMVar ()
+    return $ Scribe $ \ i@Item{..} -> do
+      when (permitItem sev i) $ bracket_ (takeMVar lock) (putMVar lock ()) $ do
+        LB.hPutBuilder h $ encodeUtf8Builder . toLazyTextWith 4096 $ formatItem colorize verb i <> singleton '\n'
+        hFlush h
 
 -------------------------------------------------------------------------------
 formatItem :: LogItem a => Bool -> Verbosity -> Item a -> Builder
 formatItem withColor verb Item{..} =
     brackets nowStr <>
     brackets (mconcat $ map fromText $ intercalateNs _itemNamespace) <>
-    brackets (fromText (renderSeverity' _itemSeverity)) <>
+    brackets (renderSeverity' _itemSeverity) <>
     brackets (fromString _itemHost) <>
     brackets (fromString (show _itemProcess)) <>
     brackets (fromText (getThreadIdText _itemThread)) <>
-    mconcat ks <>
+    --mconcat ks <>
+    getKeys' verb _itemPayload<>
     maybe mempty (brackets . fromString . locationToString) _itemLoc <>
     fromText " " <> (unLogStr _itemMessage)
   where
@@ -90,12 +127,12 @@ formatItem withColor verb Item{..} =
       CriticalS  -> red $ renderSeverity s
       ErrorS     -> red $ renderSeverity s
       WarningS   -> yellow $ renderSeverity s
-      _         -> renderSeverity s
+      _         -> fromText (renderSeverity s)
     red = colorize "31"
     yellow = colorize "33"
     colorize c s
-      | withColor = "\ESC["<> c <> "m" <> s <> "\ESC[0m"
-      | otherwise = s
+      | withColor = "\ESC["<> c <> "m" <> fromText s <> "\ESC[0m"
+      | otherwise = fromText s
 
 
 -------------------------------------------------------------------------------
